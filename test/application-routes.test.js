@@ -1,0 +1,144 @@
+import assert from "node:assert/strict";
+import { once } from "node:events";
+import { after, before, describe, it } from "node:test";
+import jwt from "jsonwebtoken";
+import { app } from "../src/app.js";
+import { Application } from "../src/models/application.model.js";
+import { Company } from "../src/models/company.model.js";
+import { Drive } from "../src/models/drive.model.js";
+import { Student } from "../src/models/student.model.js";
+
+const secret = "application-route-test-secret";
+const studentId = "507f1f77bcf86cd799439011";
+const applicationId = "507f1f77bcf86cd799439014";
+
+describe("application route authentication", { concurrency: false }, () => {
+    let server;
+    let baseUrl;
+    let originalSecret;
+
+    before(async () => {
+        originalSecret = process.env.JWT_SECRET;
+        process.env.JWT_SECRET = secret;
+        server = app.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        baseUrl = `http://127.0.0.1:${server.address().port}/api/v1/applications`;
+    });
+
+    after(async () => {
+        if (server) {
+            await new Promise((resolve, reject) => {
+                server.close((error) => error ? reject(error) : resolve());
+                server.closeAllConnections();
+            });
+        }
+        if (originalSecret === undefined) delete process.env.JWT_SECRET;
+        else process.env.JWT_SECRET = originalSecret;
+    });
+
+    async function get(url, token) {
+        const response = await fetch(url, {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            signal: AbortSignal.timeout(2000),
+        });
+        return { status: response.status, body: await response.json() };
+    }
+
+    it("requires authentication and limits the all-applications route to Admin/TPO", async () => {
+        const anonymous = await get(baseUrl);
+        assert.equal(anonymous.status, 401);
+        const studentToken = jwt.sign({ studentId }, secret);
+        const student = await get(baseUrl, studentToken);
+        assert.equal(student.status, 403);
+    });
+
+    it("blocks student status changes at the route authorization layer", async () => {
+        const studentToken = jwt.sign({ studentId }, secret);
+        const response = await fetch(`${baseUrl}/${applicationId}/status`, {
+            method: "PATCH",
+            headers: { Authorization: `Bearer ${studentToken}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ status: "Selected" }),
+            signal: AbortSignal.timeout(2000),
+        });
+        assert.equal(response.status, 403);
+        assert.deepEqual(await response.json(), { message: "Insufficient permissions" });
+    });
+
+    it("serves the mounted student application endpoint using token identity", async (t) => {
+        t.mock.method(Student, "findById", () => {
+            const query = { select: () => query, lean: async () => ({ isActive: true }) };
+            return query;
+        });
+        const find = t.mock.method(Application, "find", (filter) => {
+            assert.deepEqual(filter, { student: studentId });
+            const query = { sort: () => query, skip: () => query, limit: () => query, populate: () => query, lean: async () => [] };
+            return query;
+        });
+        t.mock.method(Application, "countDocuments", async () => 0);
+        t.mock.method(Application, "aggregate", async () => []);
+        const studentToken = jwt.sign({ studentId }, secret);
+        const response = await get(`${baseUrl}/my`, studentToken);
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body.applications, []);
+        assert.deepEqual(response.body.summary, { total: 0, pending: 0, shortlisted: 0, selected: 0, rejected: 0 });
+        assert.equal(find.mock.callCount(), 1);
+    });
+
+    it("rejects a disabled student even when their JWT has not expired", async (t) => {
+        t.mock.method(Student, "findById", () => {
+            const query = { select: () => query, lean: async () => ({ isActive: false }) };
+            return query;
+        });
+        const studentToken = jwt.sign({ studentId }, secret, { expiresIn: "1h" });
+        const response = await get(`${baseUrl}/my`, studentToken);
+        assert.equal(response.status, 403);
+        assert.deepEqual(response.body, { message: "Student account is disabled" });
+    });
+
+    it("authenticates recommendations, uses the token student, and applies through the existing endpoint", async (t) => {
+        const driveId = "507f1f77bcf86cd799439016";
+        t.mock.method(Student, "findById", () => {
+            const profile = { _id: studentId, isActive: true, cgpa: 8, department: "CSE", graduationYear: 2027, activeBacklogs: 0, skills: ["Node.js"], resumeUrl: "https://resume.example/student.pdf" };
+            const query = { select: () => query, lean: async () => profile };
+            return query;
+        });
+        t.mock.method(Company, "find", () => {
+            const query = { select: () => query, lean: async () => [{ _id: "507f1f77bcf86cd799439017" }] };
+            return query;
+        });
+        const role = { _id: driveId, title: "Backend Engineer", description: "Build services", location: "Pune", jobType: "Full-time", workMode: "Hybrid", status: "Published", applicationDeadline: new Date(Date.now() + 86_400_000), requiredSkills: ["Node.js"], eligibility: { minCGPA: 7 }, company: { _id: "507f1f77bcf86cd799439017", name: "Example" } };
+        t.mock.method(Drive, "find", () => {
+            const query = { populate: () => query, lean: async () => [role] };
+            return query;
+        });
+        t.mock.method(Drive, "findById", (id) => {
+            assert.equal(id, driveId);
+            return Promise.resolve({ ...role });
+        });
+        t.mock.method(Company, "findById", async () => ({ isActive: true }));
+        t.mock.method(Application, "find", (filter) => {
+            assert.deepEqual(filter, { student: studentId });
+            const query = { select: () => query, lean: async () => [] };
+            return query;
+        });
+        t.mock.method(Application, "create", async (document) => ({ _id: "507f1f77bcf86cd799439018", ...document }));
+        t.mock.method(Application, "countDocuments", async () => 0);
+
+        const anonymous = await fetch(`${baseUrl.replace("/applications", "/drives")}/recommendations`);
+        assert.equal(anonymous.status, 401);
+        const token = jwt.sign({ studentId }, secret);
+        const recommended = await fetch(`${baseUrl.replace("/applications", "/drives")}/recommendations?studentId=507f1f77bcf86cd799439099`, { headers: { Authorization: `Bearer ${token}` } });
+        assert.equal(recommended.status, 200);
+        const recommendationBody = await recommended.json();
+        assert.equal(recommendationBody.recommendations[0].drive._id, driveId);
+        assert.equal(recommendationBody.recommendations[0].eligibilityStatus, "ELIGIBLE");
+
+        const application = await fetch(baseUrl, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ driveId: recommendationBody.recommendations[0].drive._id }),
+        });
+        assert.equal(application.status, 201);
+        assert.equal((await application.json()).application.student, studentId);
+    });
+});

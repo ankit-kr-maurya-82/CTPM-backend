@@ -1,0 +1,141 @@
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function isValidEmail(email) { return typeof email === "string" && emailPattern.test(email.trim()); }
+export function getEligibilityExclusionReason(student, eligibility = {}) {
+    const hasEducationData = [student.department, student.course].some((value) => typeof value === "string" && value.trim())
+        || Number.isInteger(student.graduationYear) && student.graduationYear >= 1900
+        || typeof student.cgpa === "number" && Number.isFinite(student.cgpa) && student.cgpa >= 0 && student.cgpa <= 10
+        || Number.isInteger(student.activeBacklogs) && student.activeBacklogs >= 0;
+    if (!hasEducationData) return "missingEducationData";
+    if (eligibility.minCGPA !== undefined && (typeof student.cgpa !== "number" || student.cgpa < eligibility.minCGPA)) return "minCGPA";
+    if (eligibility.allowedBranches?.length) {
+        const branches = [student.department, student.course].filter(Boolean).map((v) => v.trim().toLowerCase());
+        if (!eligibility.allowedBranches.some((v) => branches.includes(v.trim().toLowerCase()))) return "allowedBranches";
+    }
+    if (eligibility.graduationYear !== undefined && student.graduationYear !== eligibility.graduationYear) return "graduationYear";
+    if (eligibility.maxBacklogs !== undefined && (typeof student.activeBacklogs !== "number" || student.activeBacklogs > eligibility.maxBacklogs)) return "maxBacklogs";
+    return null;
+}
+export function isEligibleStudent(student, eligibility = {}) { return getEligibilityExclusionReason(student, eligibility) === null; }
+
+export function getApplyUrl(driveId) {
+    const base = process.env.FRONTEND_URL || "http://localhost:5173";
+    return `${base.replace(/\/$/, "")}/drives/${encodeURIComponent(String(driveId))}`;
+}
+
+function escapeHtml(value = "") {
+    return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
+export function createVacancyEmail(drive, company, applyUrl) {
+    const title = escapeHtml(drive.title);
+    const companyName = escapeHtml(company.name || company.companyName || "A hiring company");
+    const description = escapeHtml(drive.description).replace(/\n/g, "<br>");
+    const skills = (drive.requiredSkills || []).map(escapeHtml).join(", ") || "As described in the role";
+    const eligibility = drive.eligibility || {};
+    const criteria = [eligibility.minCGPA != null ? `Minimum CGPA: ${escapeHtml(eligibility.minCGPA)}` : "", eligibility.allowedBranches?.length ? `Branches: ${eligibility.allowedBranches.map(escapeHtml).join(", ")}` : "", eligibility.graduationYear ? `Graduation year: ${escapeHtml(eligibility.graduationYear)}` : "", eligibility.maxBacklogs != null ? `Maximum active backlogs: ${escapeHtml(eligibility.maxBacklogs)}` : ""].filter(Boolean).join(" · ") || "See the role description";
+    const url = escapeHtml(applyUrl);
+    const plainText = [
+        `${drive.title} at ${company.name || company.companyName || "our company"}`,
+        "",
+        drive.description,
+        `Location: ${drive.location}`,
+        `Package: ${drive.ctc || "Not specified"}`,
+        `Required skills: ${(drive.requiredSkills || []).join(", ") || "As described in the role"}`,
+        `Eligibility: ${criteria.replaceAll(" · ", "; ")}`,
+        `Application deadline: ${new Date(drive.applicationDeadline).toLocaleDateString("en-IN")}`,
+        `Apply Now: ${applyUrl}`,
+    ].join("\n");
+    return {
+        subject: `${drive.title} opportunity at ${company.name || company.companyName || "our company"}`,
+        html: `<div style="font-family:Arial,sans-serif;color:#1f2937;max-width:640px;margin:auto"><h1 style="color:#173b70">${title}</h1><p>Hello,</p><p>${companyName} is inviting eligible students to apply for this opportunity.</p><p>${description}</p><table style="border-collapse:collapse;width:100%"><tr><td><b>Package</b></td><td>${escapeHtml(drive.ctc || "Not specified")}</td></tr><tr><td><b>Location</b></td><td>${escapeHtml(drive.location)}</td></tr><tr><td><b>Required skills</b></td><td>${skills}</td></tr><tr><td><b>Eligibility</b></td><td>${criteria}</td></tr><tr><td><b>Apply by</b></td><td>${escapeHtml(new Date(drive.applicationDeadline).toLocaleDateString("en-IN"))}</td></tr></table><p style="margin:28px 0"><a href="${url}" style="background:#1d4ed8;color:white;padding:12px 20px;text-decoration:none;border-radius:5px">Apply Now</a></p><p>We look forward to your application.</p></div>`,
+        text: plainText,
+    };
+}
+
+let transportFactory = async (options) => (await import("nodemailer")).createTransport(options);
+let cachedTransport;
+export function setTransportFactory(factory) { transportFactory = factory; cachedTransport = undefined; }
+
+function getSmtpOptions() {
+    const { SMTP_HOST = "smtp.gmail.com", SMTP_PORT = "465", SMTP_USER, SMTP_PASS } = process.env;
+    const from = process.env.EMAIL_FROM || process.env.SMTP_FROM || SMTP_USER;
+    const port = Number(SMTP_PORT);
+    const secureSetting = process.env.SMTP_SECURE?.toLowerCase();
+    if (!SMTP_HOST || !Number.isInteger(port) || port < 1 || port > 65535 || !SMTP_USER || !SMTP_PASS || !from || (secureSetting && !["true", "false"].includes(secureSetting))) throw new Error("Email delivery is not configured");
+    const secure = secureSetting == null ? port === 465 : secureSetting === "true";
+    return { from, options: { host: SMTP_HOST, port, secure, auth: { user: SMTP_USER, pass: SMTP_PASS }, connectionTimeout: 15000, socketTimeout: 30000 } };
+}
+
+async function getTransport() {
+    const { options } = getSmtpOptions();
+    cachedTransport ??= await transportFactory(options);
+    return cachedTransport;
+}
+
+export async function verifySmtpConnection() {
+    const transport = await getTransport();
+    return transport.verify();
+}
+
+export async function sendVacancyEmail({ to, drive, company, applyUrl }) {
+    const { from } = getSmtpOptions();
+    const transport = await getTransport();
+    return transport.sendMail({ from, to, ...createVacancyEmail(drive, company, applyUrl) });
+}
+
+function formatInterviewTime(value, timeZone) {
+    return new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone }).format(new Date(value));
+}
+
+function escapeInterviewHtml(value = "") {
+    return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+}
+
+export async function sendInterviewEmail({ to, studentName, companyName, driveTitle, action, interview }) {
+    const { from } = getSmtpOptions();
+    const transport = await getTransport();
+    const actionText = action === "SCHEDULED" ? "scheduled" : action === "RESCHEDULED" ? "rescheduled" : "cancelled";
+    const start = formatInterviewTime(interview.startAt, interview.timeZone);
+    const end = formatInterviewTime(interview.endAt, interview.timeZone);
+    const mode = interview.mode === "ONLINE" ? "Online" : interview.mode === "OFFLINE" ? "In person" : "Phone";
+    const accessDetails = interview.mode === "ONLINE"
+        ? `Meeting link: ${interview.meetingLink || "See your placement portal"}`
+        : interview.mode === "OFFLINE" ? `Venue: ${interview.venue || "See your placement portal"}` : "The company will contact you by phone.";
+    const instructions = interview.instructions?.trim() ? `Instructions: ${interview.instructions.trim()}` : "";
+    const title = `${driveTitle} interview ${actionText}`;
+    const text = [
+        `Hello ${studentName || "student"},`,
+        `${companyName} has ${actionText} your interview for ${driveTitle}.`,
+        `Date and time: ${start} to ${end} (${interview.timeZone})`,
+        `Mode: ${mode}`,
+        accessDetails,
+        instructions,
+    ].filter(Boolean).join("\n\n");
+    const html = `<p>Hello ${escapeInterviewHtml(studentName || "student")},</p><p>${escapeInterviewHtml(companyName)} has ${actionText} your interview for <b>${escapeInterviewHtml(driveTitle)}</b>.</p><p><b>Date and time:</b> ${escapeInterviewHtml(start)} to ${escapeInterviewHtml(end)} (${escapeInterviewHtml(interview.timeZone)})<br><b>Mode:</b> ${mode}</p><p>${escapeInterviewHtml(accessDetails)}</p>${instructions ? `<p>${escapeInterviewHtml(instructions)}</p>` : ""}`;
+    return transport.sendMail({ from, to, subject: title, text, html });
+}
+
+export async function sendPasswordResetEmail({ to, url }) {
+    const { from } = getSmtpOptions();
+    const transport = await getTransport();
+    return transport.sendMail({
+        from,
+        to,
+        subject: "Reset your placement system password",
+        text: `A password reset was requested for your account. Use this link within 15 minutes: ${url}\n\nIf you did not request this, you can ignore this email.`,
+        html: `<p>A password reset was requested for your account.</p><p><a href="${url}">Reset your password</a> (valid for 15 minutes).</p><p>If you did not request this, you can ignore this email.</p>`,
+    });
+}
+
+export async function sendEmailVerification({ to, url }) {
+    const { from } = getSmtpOptions();
+    const transport = await getTransport();
+    return transport.sendMail({
+        from,
+        to,
+        subject: "Verify your Placement System email",
+        text: `Welcome to the College Training and Placement Management System. Verify your email using this link within 24 hours: ${url}\n\nIf you cannot open the link, copy and paste it into your browser. If you did not create this account, you can ignore this email.`,
+        html: `<h2>College Training and Placement Management System</h2><p>Please verify your email address to activate your account.</p><p><a href="${url}">Verify email</a> (link expires in 24 hours).</p><p>If the button does not work, copy and paste this link into your browser:<br><a href="${url}">${url}</a></p><p>If you did not create this account, you can ignore this email.</p>`,
+    });
+}
